@@ -1,29 +1,99 @@
-"""Tests voor het transcript module."""
+"""Offline regressions for the actual TranscriptAPI.com client."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import Mock, patch
 
-from youtube_transcriptor.transcript import get_transcript
+import pytest
+import requests
+
+from youtube_transcriptor.transcript import API_BASE_URL, get_transcript, get_video_metadata
 
 
-class TestGetTranscript:
-    """Tests voor get_transcript functie."""
+@pytest.fixture(autouse=True)
+def isolated_credentials(monkeypatch):
+    monkeypatch.setenv("TRANSCRIPT_API_KEY", "offline-fixture-key")
 
-    @patch("youtube_transcriptor.transcript.YouTubeTranscriptApi")
-    def test_fetch_default_languages(self, mock_api_class: MagicMock) -> None:
-        mock_instance = MagicMock()
-        mock_api_class.return_value = mock_instance
-        mock_instance.fetch.return_value = MagicMock()
 
-        get_transcript("test_video_id")
+@patch("youtube_transcriptor.transcript.requests.get")
+def test_transcript_uses_current_api_and_preserves_segments(get):
+    segments = [{"text": "Een voorbeeld", "start": 1.5, "duration": 2.0}]
+    get.return_value = Mock(status_code=200, json=Mock(return_value={"transcript": segments}))
 
-        mock_instance.fetch.assert_called_once_with("test_video_id", languages=["nl", "en"])
+    assert get_transcript("fixture-video") == segments
 
-    @patch("youtube_transcriptor.transcript.YouTubeTranscriptApi")
-    def test_fetch_custom_languages(self, mock_api_class: MagicMock) -> None:
-        mock_instance = MagicMock()
-        mock_api_class.return_value = mock_instance
-        mock_instance.fetch.return_value = MagicMock()
+    get.assert_called_once_with(
+        f"{API_BASE_URL}/transcript",
+        params={"video_url": "fixture-video", "format": "json"},
+        headers={"Authorization": "Bearer offline-fixture-key"},
+        timeout=30,
+    )
+    get.return_value.raise_for_status.assert_called_once_with()
 
-        get_transcript("test_video_id", languages=["en"])
 
-        mock_instance.fetch.assert_called_once_with("test_video_id", languages=["en"])
+@patch("youtube_transcriptor.transcript.requests.get")
+def test_missing_key_fails_before_making_any_request(get, monkeypatch):
+    monkeypatch.delenv("TRANSCRIPT_API_KEY")
+    with pytest.raises(ValueError, match="TRANSCRIPT_API_KEY"):
+        get_transcript("fixture-video")
+    get.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("status", "message"),
+    [
+        (401, "Invalid API key"),
+        (402, "credits exhausted"),
+        (404, "No transcript available"),
+        (408, "Request timeout"),
+    ],
+)
+@patch("youtube_transcriptor.transcript.requests.get")
+def test_known_service_failures_are_actionable(get, status, message):
+    get.return_value = Mock(status_code=status)
+    with pytest.raises(RuntimeError, match=message):
+        get_transcript("fixture-video")
+    get.return_value.json.assert_not_called()
+
+
+@patch("youtube_transcriptor.transcript.requests.get")
+def test_unknown_http_failure_is_not_reported_as_an_empty_transcript(get):
+    get.return_value = Mock(status_code=503)
+    get.return_value.raise_for_status.side_effect = requests.HTTPError("fixture unavailable")
+    with pytest.raises(requests.HTTPError):
+        get_transcript("fixture-video")
+    get.return_value.json.assert_not_called()
+
+
+@patch("youtube_transcriptor.transcript.requests.get")
+def test_network_timeout_propagates(get):
+    get.side_effect = requests.Timeout("offline timeout")
+    with pytest.raises(requests.Timeout, match="offline timeout"):
+        get_transcript("fixture-video")
+
+
+@patch("youtube_transcriptor.transcript.yt_dlp.YoutubeDL")
+def test_video_metadata_disables_downloads_and_maps_fields(youtube_dl):
+    client = youtube_dl.return_value.__enter__.return_value
+    client.extract_info.return_value = {
+        "uploader": "Fixture",
+        "upload_date": "20261102",
+        "title": "Voorbeeld",
+    }
+    assert get_video_metadata("fixture-video") == {
+        "channel": "Fixture",
+        "upload_date": "20261102",
+        "title": "Voorbeeld",
+    }
+    assert youtube_dl.call_args.args[0]["skip_download"] is True
+    client.extract_info.assert_called_once_with(
+        "https://www.youtube.com/watch?v=fixture-video", download=False
+    )
+
+
+@patch("youtube_transcriptor.transcript.yt_dlp.YoutubeDL")
+def test_unavailable_metadata_has_existing_safe_fallback(youtube_dl):
+    youtube_dl.return_value.__enter__.return_value.extract_info.return_value = None
+    assert get_video_metadata("fixture-video") == {
+        "channel": "unknown_channel",
+        "upload_date": "",
+        "title": "unknown_title",
+    }
